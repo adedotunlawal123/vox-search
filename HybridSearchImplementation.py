@@ -1,7 +1,8 @@
 # Search implementation
 import math
 from typing import Optional, Any, List, Dict, Tuple
-
+import re
+from ChunckAndEmbed import generate_embedding as generate_embedding
 
 class VectorIndex:
     def __init__(

@@ -1,3 +1,8 @@
+
+import re
+import voyageai
+vog_client = voyageai.Client()
+
 def chunk_by_sentence(text, max_sentences_per_chunk=5, overlap_sentences=1):
     sentences = re.split(r"(?<=[.!?])\s+", text)
     
