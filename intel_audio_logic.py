@@ -12,6 +12,7 @@ from ChunckAndEmbed import generate_embedding as embedder
 from HybridSearchImplementation import VectorIndex
 from HybridSearchImplementation import BM25Index
 from HybridSearchImplementation import Retriever
+from ConversationHandler import converse_with_LLM
 
 
 
@@ -46,6 +47,14 @@ retriever = Retriever(bm25_index, vector_index)
 # Add all chunks to the retriever, which internally passes them along to both indexes
 retriever.add_documents([{"content": chunk} for chunk in chunks])
 
+
+converse_with_LLM()
+
+
+
+
+
+"""
 message = []
 
 
@@ -111,4 +120,4 @@ def converse_with_LLM():
 
     print(ai_answer)
 
-
+"""
