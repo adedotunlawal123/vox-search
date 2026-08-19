@@ -10,19 +10,19 @@ class ConversationHandler:
             based on the context below. Use the context to find relevant information. 
             If the answer is not found in the context, say "I dont have the information to answer that question".
 
-The Question is
-<question>
-{question}
+        The Question is
+        <question>
+        {question}
 
 
 
-The context is 
-<context>
-{needed_context}
-<\context>
-"""
-}
-self.messages.append(user_prompt)
+        The context is 
+        <context>
+        {needed_context}
+        <\context>
+        """
+        }
+        self.messages.append(user_prompt)
 
 
 
