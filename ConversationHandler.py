@@ -26,37 +26,37 @@ class ConversationHandler:
 
 
 
-def assistant_message_adder(self, text:str):
-    assistant_message = {"role":"assistant", "content":text}
-    self.messages.append(assistant_message)
+    def assistant_message_adder(self, text:str):
+        assistant_message = {"role":"assistant", "content":text}
+        self.messages.append(assistant_message)
 
-def take_input():
-    user_input = input("Type 'exit' to stop: ")
-    print(user_input)
-    return user_input
+    def take_input(self: Any):
+        user_input = input("Type 'exit' to stop: ")
+        print(user_input)
+        return user_input
 
-def context(user_input: str):
-    results = retriever.search(f"{user_input}")
-    needed_context = results[0][0]["content"]
-    return needed_context
-
-
-def ping_LLM(messages: list):
-    message = client.messages.create(
-        model=model,
-        max_tokens=500,
-        messages=messages,
-  )
-    return message.content[0].text
+    def context(self, user_input: str):
+        results = retriever.search(f"{user_input}")
+        needed_context = results[0][0]["content"]
+        return needed_context
 
 
-def converse_with_LLM():
-    user_input = self.take_input()
-    needed_context = self.context(user_input)
-    #Add user input
-    self.user_prompt_adder(self.messages, user_input, needed_context)
-    #Get Claude's response
-    ai_answer=self.ping_LLM(self.messages)
-    #Add response from claude (assistant) to my message using the adder function
-    self.assistant_message_adder(self.messages, ai_answer)
-    print(ai_answer)
+    def ping_LLM(self, messages: list):
+        message = client.messages.create(
+            model=model,
+            max_tokens=500,
+            messages=messages,
+    )
+        return message.content[0].text
+
+
+    def converse_with_LLM(self):
+        user_input = self.take_input()
+        needed_context = self.context(user_input)
+        #Add user input
+        self.user_prompt_adder(user_input, needed_context)
+        #Get Claude's response
+        ai_answer=self.ping_LLM(self.messages)
+        #Add response from claude (assistant) to my message using the adder function
+        self.assistant_message_adder(ai_answer)
+        print(ai_answer)

@@ -12,7 +12,7 @@ from ChunckAndEmbed import generate_embedding as embedder
 from HybridSearchImplementation import VectorIndex
 from HybridSearchImplementation import BM25Index
 from HybridSearchImplementation import Retriever
-from ConversationHandler import converse_with_LLM
+from ConversationHandler import ConversationHandler, converse_with_LLM
 
 
 
@@ -48,76 +48,8 @@ retriever = Retriever(bm25_index, vector_index)
 retriever.add_documents([{"content": chunk} for chunk in chunks])
 
 
-converse_with_LLM()
+#Instantiate the ConversationHandler class
+convo = ConversationHandler()
 
-
-
-
-
-"""
-message = []
-
-
-def user_prompt_adder(message, question, needed_context):
-    user_prompt = { "role":"user",
-                    "content": f"""Your task is to answers question, 
-                    based on the context below. Use the context to find relevant information. 
-                    If the answer is not found in the context, say "I dont Know".
-
-The Question is
-<question>
-{question}
-
-
-
-The context is 
-<context>
-{needed_context}
-<\context>
-"""
-}
-    
-    message.append(user_prompt)
-
-
-
-def assistant_message_adder(message, text):
-    assistant_message = {"role":"assistant", "content":text}
-    message.append(assistant_message)
-
-def take_input():
-    user_input = input("Type 'exit' to stop: ")
-    print(user_input)
-    return user_input
-
-def context(user_input: str):
-    results = retriever.search(f"{user_input}")
-    needed_context = results[0][0]["content"]
-    return needed_context
-
-def ping_LLM(messages):
-    message = client.messages.create(
-        model=model,
-        max_tokens=500,
-        messages=messages,
-    )
-    return message.content[0].text
-
-def converse_with_LLM():
-
-    user_input = take_input()
-
-    needed_context = context(user_input)
-    
-    #Add user input
-    user_prompt_adder(message, user_input, needed_context)
-
-    #Get Claude's response
-    ai_answer=ping_LLM(message)
-
-    #Add response from claude (assistant) to my message using the adder function
-    assistant_message_adder(message, ai_answer)
-
-    print(ai_answer)
-
-"""
+#Start the conversation with the LLM
+convo.converse_with_LLM()
