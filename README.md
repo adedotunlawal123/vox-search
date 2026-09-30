@@ -78,11 +78,17 @@ python intel_audio_logic.py lecture.mp3
 
 ```
 Transcribing lecture.mp3 ...
-Transcribed 5.8 min of audio in 19.9s, 17.6x realtime on cuda
-Saved transcript to transcripts\lecture.txt
-Indexing 13 chunks ...
+Transcribed 5:50 of audio in 8.7s, 40.5x realtime on cuda
+Saved transcript to transcripts\lecture.json
+Indexing 21 timestamped chunks ...
 
-Ask about the audio (or 'exit' to quit):
+Ask about the audio (or 'exit' to quit): what was said about attention?
+
+Attention is the mechanism that lets the model weigh every word in the
+sequence at once rather than reading strictly in order. This was said at
+2:31-2:58 in the audio.
+
+  [audio 2:31-2:58]
 ```
 
 Transcription runs on the GPU when one is available (see
@@ -124,6 +130,29 @@ Each run does the following:
 4. Start an interactive conversation loop — type `exit` to quit
 
 **Alternatively**, run `RAGChat.ipynb` in Jupyter for step-by-step exploration.
+
+### Finding when something was said
+
+Answers point back to where in the audio the supporting context came from. Every
+chunk carries a start and end time, which is handed to Claude alongside the text and
+printed under each answer as `[audio 2:31-2:58]` — so you can jump straight to that
+point in the recording. Asking "when did they mention X?" works directly.
+
+Timestamps come from Whisper's segments, which `chunk_segments()` narrows down: a
+segment can span 30 seconds and several sentences, so sentence times are interpolated
+across it by character position. Two things affect how tight the citations are:
+
+- **`--batch-size`** makes transcription much faster but produces coarser (~30 s)
+  segments. Leave it off when you care more about pinpointing a quote than speed.
+- **Larger models** segment more accurately, so `--whisper-model large-v3` gives
+  better boundaries than `base`.
+
+Transcripts are cached as `transcripts/<name>.json` (segments and all) plus a
+`.txt` copy for reading. A plain-text transcript passed via `--transcript` has no
+timing, so answers from it simply come without a citation.
+
+For subtitles rather than chat, `transcribe.py -f srt` or `-f vtt` writes standard
+timestamped subtitle files, and `-f json` gives every segment with its times.
 
 ## Transcription (`transcribe.py`)
 
@@ -235,6 +264,13 @@ If a model does not fit, the script reports the load failure and suggests
   use `--backend faster-whisper` or reinstall PyTorch with CUDA support.
 - **Out of memory** — the script suggests a smaller `--model`, a smaller
   `--batch-size`, or `--compute-type int8_float16`.
+- **`open() got an unexpected keyword argument 'metadata_errors'`** — PyAV 19 broke
+  compatibility with `faster-whisper` 1.2. Pin it: `pip install "av<19"`.
+- **`voyageai.error.RateLimitError`** — Voyage's free tier allows only 3 requests
+  and 10K tokens per minute, which a long transcript exceeds. `generate_embedding()`
+  splits the work into ~8K-token requests and backs off when the limit is hit, so
+  indexing a two-hour recording still completes, just slowly. Adding a payment
+  method to the Voyage account removes the wait.
 
 ### Using it from Python
 

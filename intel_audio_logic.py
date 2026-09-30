@@ -2,15 +2,18 @@
 
     python intel_audio_logic.py                                  # chat over the existing transcript
     python intel_audio_logic.py lecture.mp3                       # transcribe, then chat
-    python intel_audio_logic.py lecture.mp3 --model large-v3       # better accuracy
+    python intel_audio_logic.py lecture.mp3 --whisper-model large-v3   # better accuracy
     python intel_audio_logic.py lecture.mp3 --retranscribe         # ignore the cached transcript
     python intel_audio_logic.py --transcript Learn_Transformer     # use a transcript you already have
+
+Answers cite the point in the audio the context came from, e.g. [12:34-13:01].
 
 Transcription itself lives in transcribe.py, which picks the GPU when one is
 available. Run `python transcribe.py --list-devices` to see what this machine will use.
 """
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -19,27 +22,33 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from ChunckAndEmbed import chunk_by_sentence as chunker
+from ChunckAndEmbed import chunk_segments
 from ChunckAndEmbed import generate_embedding as embedder
 from HybridSearchImplementation import VectorIndex
 from HybridSearchImplementation import BM25Index
 from HybridSearchImplementation import Retriever
 from ConversationHandler import ConversationHandler, DEFAULT_MODEL
-from transcribe import transcribe_audio
+from transcribe import transcribe_audio, format_clock
 
 # Transcript used when no audio file is given.
 DEFAULT_TRANSCRIPT = Path("Learn_Transformer")
 # Transcripts produced from audio are cached here so a rerun does not re-transcribe.
+# Cached as JSON rather than plain text, so segment timestamps survive the round trip.
 TRANSCRIPT_DIR = Path("transcripts")
 
 
-def get_transcript(args) -> str:
-    """Return the transcript text, transcribing the audio only when necessary."""
+def get_transcript(args) -> dict:
+    """Return ``{"text", "segments"}``, transcribing the audio only when necessary.
+
+    ``segments`` is empty for a plain-text transcript, which simply means answers
+    cannot be traced back to a position in the audio.
+    """
     if args.transcript:
         source = Path(args.transcript)
         if not source.is_file():
             raise SystemExit(f"error: transcript not found: {source}")
         print(f"Using transcript {source}")
-        return source.read_text(encoding="utf-8")
+        return load_transcript_file(source)
 
     if not args.audio:
         if not DEFAULT_TRANSCRIPT.is_file():
@@ -48,21 +57,21 @@ def get_transcript(args) -> str:
                 "Pass an audio file: python intel_audio_logic.py your_audio.mp3"
             )
         print(f"Using transcript {DEFAULT_TRANSCRIPT}")
-        return DEFAULT_TRANSCRIPT.read_text(encoding="utf-8")
+        return load_transcript_file(DEFAULT_TRANSCRIPT)
 
     audio = Path(args.audio)
     if not audio.is_file():
         raise SystemExit(f"error: audio file not found: {audio}")
 
     # Reuse a previous transcript unless the audio is newer or --retranscribe was asked for.
-    cached = TRANSCRIPT_DIR / f"{audio.stem}.txt"
+    cached = TRANSCRIPT_DIR / f"{audio.stem}.json"
     if (
         cached.is_file()
         and not args.retranscribe
         and cached.stat().st_mtime >= audio.stat().st_mtime
     ):
         print(f"Using cached transcript {cached} (--retranscribe to redo it)")
-        return cached.read_text(encoding="utf-8")
+        return load_transcript_file(cached)
 
     print(f"Transcribing {audio.name} ...")
     started = time.perf_counter()
@@ -78,20 +87,36 @@ def get_transcript(args) -> str:
 
     speed = f", {result['duration'] / elapsed:.1f}x realtime" if elapsed > 0 else ""
     print(
-        f"Transcribed {result['duration'] / 60:.1f} min of audio in {elapsed:.1f}s"
-        f"{speed} on {result.get('device', args.device)}"
+        f"Transcribed {format_clock(result['duration'])} of audio in {elapsed:.1f}s"
+        f"{speed} on {result['device']}"
     )
 
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    cached.write_text(result["text"], encoding="utf-8")
+    cached.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    # A plain-text copy too, for reading or feeding to anything else.
+    cached.with_suffix(".txt").write_text(result["text"], encoding="utf-8")
     print(f"Saved transcript to {cached}")
-    return result["text"]
+    return result
 
 
-def build_retriever(text: str) -> Retriever:
+def load_transcript_file(path: Path) -> dict:
+    """Load a cached JSON transcript, or a plain-text one with no timestamps."""
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {"text": data.get("text", ""), "segments": data.get("segments", [])}
+    return {"text": path.read_text(encoding="utf-8"), "segments": []}
+
+
+def build_retriever(transcript: dict) -> Retriever:
     """Chunk the transcript and index it for hybrid (vector + keyword) search."""
-    chunks = chunker(text)
-    print(f"Indexing {len(chunks)} chunks ...")
+    segments = transcript.get("segments")
+    if segments:
+        # Timestamped chunks, so a retrieved chunk can be cited back to the audio.
+        documents = chunk_segments(segments)
+        print(f"Indexing {len(documents)} timestamped chunks ...")
+    else:
+        documents = [{"content": chunk} for chunk in chunker(transcript["text"])]
+        print(f"Indexing {len(documents)} chunks (no timestamps in this transcript) ...")
 
     # Generate a vector embedding of the chunks using VoyageAI;
     # see HybridSearchImplementation for more details.
@@ -103,14 +128,15 @@ def build_retriever(text: str) -> Retriever:
     retriever = Retriever(bm25_index, vector_index)
 
     # Add all chunks to the retriever, which internally passes them along to both indexes
-    retriever.add_documents([{"content": chunk} for chunk in chunks])
+    retriever.add_documents(documents)
     return retriever
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="intel_audio_logic.py",
-        description="Transcribe audio (GPU-accelerated) and chat about it with Claude.",
+        description="Transcribe audio (GPU-accelerated) and chat about it with Claude, "
+                    "with answers pointing back to where in the audio they came from.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("\n\n")[1],
     )
@@ -141,7 +167,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transcription.add_argument(
         "--batch-size", type=int, default=0, metavar="N",
-        help="batched GPU decoding, a large speedup (try 8 or 16; default: off)",
+        help="batched GPU decoding, a large speedup, but coarser timestamps "
+             "(try 8 or 16; default: off)",
     )
 
     p.add_argument(
@@ -154,8 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
-    text = get_transcript(args)
-    retriever = build_retriever(text)
+    transcript = get_transcript(args)
+    retriever = build_retriever(transcript)
 
     # Instantiate the ConversationHandler class with the index it should search
     convo = ConversationHandler(retriever, model=args.llm_model)

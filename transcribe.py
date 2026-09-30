@@ -350,9 +350,14 @@ def _timestamp(seconds: float, millis_sep: str = ",") -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{millis_sep}{ms:03d}"
 
 
-def _clock(seconds: float) -> str:
+def format_clock(seconds: float) -> str:
+    """Compact stamp for humans: 4:05, or 1:23:45 once the audio passes an hour."""
     total = max(0, int(seconds))
-    return f"{total // 60:02d}:{total % 60:02d}"
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def render(result: dict, fmt: str) -> str:
@@ -604,7 +609,7 @@ def main(argv=None) -> int:
                 if done - _state["last"] >= 1.0 or done >= total:
                     _state["last"] = done
                     pct = 100.0 * done / total
-                    print(f"\r  {pct:5.1f}%  {_clock(done)} / {_clock(total)}",
+                    print(f"\r  {pct:5.1f}%  {format_clock(done)} / {format_clock(total)}",
                           end="", file=sys.stderr, flush=True)
 
         log(f"transcribing {audio.name} ...")
@@ -638,7 +643,7 @@ def main(argv=None) -> int:
         result["device"] = device
 
         speed = f", {result['duration'] / elapsed:.1f}x realtime" if elapsed > 0 and result["duration"] else ""
-        log(f"done in {elapsed:.1f}s ({_clock(result['duration'])} of audio{speed}), "
+        log(f"done in {elapsed:.1f}s ({format_clock(result['duration'])} of audio{speed}), "
             f"language={result['language']}, {len(result['segments'])} segments")
 
         text = render(result, args.output_format)
