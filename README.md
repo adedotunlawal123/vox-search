@@ -108,13 +108,18 @@ python intel_audio_logic.py lecture.mp3 --batch-size 16
 # chat over a transcript you already have
 python intel_audio_logic.py --transcript Learn_Transformer
 
+# a cached transcript by name -- these are all equivalent
+python intel_audio_logic.py --transcript wrd
+python intel_audio_logic.py --transcript wrd.json
+python intel_audio_logic.py --transcript transcripts/wrd.json
+
 # no arguments: uses the bundled Learn_Transformer transcript
 python intel_audio_logic.py
 ```
 
 | Flag | Purpose |
 |------|---------|
-| `-t, --transcript` | Chat over an existing transcript instead of transcribing |
+| `-t, --transcript` | Chat over an existing transcript instead of transcribing. Accepts a path, or a name from `transcripts/` with or without its extension; a bare name prefers the timestamped `.json` |
 | `--retranscribe` | Re-transcribe even if a cached transcript exists |
 | `-m, --whisper-model` | Whisper model size (default `base`) |
 | `-d, --device` | `auto` (default), `cuda`, `mps`, `cpu` |
@@ -148,7 +153,9 @@ across it by character position. Two things affect how tight the citations are:
   better boundaries than `base`.
 
 Transcripts are cached as `transcripts/<name>.json` (segments and all) plus a
-`.txt` copy for reading. A plain-text transcript passed via `--transcript` has no
+`.txt` copy for reading. `--transcript` looks in that directory too, so
+`--transcript wrd` finds `transcripts/wrd.json`; if nothing matches, it lists what
+is cached. A plain-text transcript passed via `--transcript` has no
 timing, so answers from it simply come without a citation.
 
 For subtitles rather than chat, `transcribe.py -f srt` or `-f vtt` writes standard
