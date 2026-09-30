@@ -7,9 +7,9 @@ A Retrieval-Augmented Generation (RAG) chatbot that processes audio content and 
 ```
 Audio File
     ↓
-Whisper Transcription → Text Transcript
+Whisper Transcription (GPU) → Transcript + segment timings
     ↓
-Sentence-based Chunking (with overlap)
+Sentence-based Chunking (with overlap, timings carried along)
     ↓
     ┌──────────────────────┬──────────────────────┐
     │   Vector Index       │    BM25 Index         │
@@ -22,6 +22,8 @@ Sentence-based Chunking (with overlap)
          Context-Augmented Prompt
                     ↓
             Claude API Response
+                    ↓
+      Answer + [audio 2:31-2:58] citation
                     ↓
          Conversation History Loop
 ```
@@ -39,6 +41,8 @@ The system combines **semantic vector search** and **BM25 keyword search**, merg
 | `ChunckAndEmbed.py` | Text chunking and Voyage AI embedding utilities |
 | `RAGChat.ipynb` | Jupyter notebook for development and experimentation |
 | `Learn_Transformer` | Sample transcript (about Transformer models in ML) |
+| `transcripts/` | Cached transcripts written by the pipeline (git-ignored) |
+| `changes` | Timestamped log of what changed on the `gpu-transcription` branch |
 
 ## Setup
 
@@ -52,9 +56,12 @@ The system combines **semantic vector search** and **BM25 keyword search**, merg
 
 ```bash
 pip install anthropic voyageai python-dotenv
-pip install faster-whisper                       # transcription (GPU + CPU)
+pip install faster-whisper "av<19"               # transcription (GPU + CPU)
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12  # only for NVIDIA GPUs
 ```
+
+The `av<19` pin is required: PyAV 19 is incompatible with `faster-whisper` 1.2 and
+fails at decode time with `open() got an unexpected keyword argument 'metadata_errors'`.
 
 `openai-whisper` also works as a fallback backend (`pip install openai-whisper`) and is
 the only option for Apple Silicon GPUs (MPS).
@@ -130,7 +137,7 @@ python intel_audio_logic.py
 Each run does the following:
 
 1. Transcribe the audio on the GPU, or reuse the cached transcript
-2. Chunk it into overlapping sentence windows
+2. Chunk it into overlapping sentence windows, each tagged with its time in the audio
 3. Build vector and BM25 search indexes over the chunks
 4. Start an interactive conversation loop — type `exit` to quit
 
@@ -191,8 +198,8 @@ Selected: backend=faster-whisper device=cuda compute_type=float16
 # transcript to stdout
 python transcribe.py audio.mp3
 
-# feed the RAG pipeline: write the transcript where intel_audio_logic.py reads it
-python transcribe.py audio.mp3 --model large-v3 -o Learn_Transformer
+# keep the timestamps: JSON is the only format that carries them
+python transcribe.py audio.mp3 --model large-v3 -f json -o transcripts/audio.json
 
 # subtitles, with timestamps
 python transcribe.py lecture.m4a --output-format srt -o lecture.srt
@@ -230,15 +237,20 @@ clean transcript and can be piped.
 
 ### Measured speedup
 
-Same 5:50 clip, `base` model, RTX 4050 Laptop (6 GB) vs. a 20-thread CPU:
+Same 5:50 clip, `base` model, RTX 4050 Laptop (6 GB) vs. a 20-thread CPU. Each figure
+is the median of three runs with the model and audio already cached:
 
 | Command | Time | Speed |
 |---------|------|-------|
-| `--device cpu` (int8) | 83.4 s | 4.2x realtime |
-| GPU default (float16, beam 5) | 25.1 s | 13.9x realtime |
-| `--batch-size 16 --beam-size 1` | **8.0 s** | **43.8x realtime** |
+| `--device cpu` (int8) | ~30 s | 11.5x realtime |
+| GPU default (float16, beam 5) | ~10.5 s | 33x realtime |
+| `--batch-size 16` | **~4 s** | **60–95x realtime** |
 
-`large-v3` also fits in 6 GB: 23.5 s at `--batch-size 8` (14.9x realtime), with
+The batched figure is the noisiest — it ranged from 3.7 s to 5.9 s across runs, since
+at that speed a few hundred milliseconds of scheduling dominates. A first run on a
+cold file cache is roughly 2–3x slower than all of these.
+
+`large-v3` also fits in 6 GB: ~18 s at `--batch-size 8` (19x realtime), with
 noticeably better punctuation and fewer stutters than `base`.
 
 ### Picking a model for your GPU
@@ -256,7 +268,7 @@ noticeably better punctuation and fewer stutters than `base`.
 If a model does not fit, the script reports the load failure and suggests
 `--device cpu`. You can also trade accuracy for memory with `--compute-type int8_float16`.
 
-### Troubleshooting
+### Troubleshooting transcription
 
 - **`Library cublas64_12.dll is not found` / `libcublas.so.12: cannot open shared object file`** —
   the CUDA runtime is missing. `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12`.
@@ -273,15 +285,6 @@ If a model does not fit, the script reports the load failure and suggests
   `--batch-size`, or `--compute-type int8_float16`.
 - **`open() got an unexpected keyword argument 'metadata_errors'`** — PyAV 19 broke
   compatibility with `faster-whisper` 1.2. Pin it: `pip install "av<19"`.
-- **`voyageai.error.RateLimitError`** — Voyage's free tier allows only 3 requests
-  and 10K tokens per minute, which a long transcript exceeds. `generate_embedding()`
-  splits the work into ~8K-token requests and backs off when the limit is hit, so
-  indexing a two-hour recording still completes, just slowly. Adding a payment
-  method to the Voyage account removes the wait; pass a larger
-  `max_tokens_per_request` to take advantage of it.
-- **One chunk is over the request budget** — printed as a warning and sent on its
-  own. Voyage truncates anything past the model's context window, so an unusually
-  long chunk may be embedded only in part.
 
 ### Using it from Python
 
@@ -289,7 +292,12 @@ If a model does not fit, the script reports the load failure and suggests
 from transcribe import transcribe_audio
 
 result = transcribe_audio("audio.mp3", model="large-v3")   # device auto-detected
-print(result["text"], result["language"], result["duration"])
+
+print(result["text"])
+print(result["language"], result["duration"], result["device"])
+
+for segment in result["segments"]:                          # timings for each span
+    print(segment["start"], segment["end"], segment["text"])
 ```
 
 ## Key Components
@@ -318,15 +326,33 @@ print(result["text"], result["language"], result["duration"])
 - **`ConversationHandler(retriever, client=None, model=...)`** — Takes the search index and Anthropic client as arguments, so the class does not depend on the entry point's globals.
 - **`converse_with_LLM()`** — Main loop: reads user input, retrieves relevant chunks, augments the prompt, calls Claude, and stores the response in conversation history. Runs until you type `exit`.
 
+## Troubleshooting indexing
+
+- **`voyageai.error.RateLimitError`** — Voyage's free tier allows only 3 requests and
+  10K tokens per minute, which a long transcript exceeds. `generate_embedding()`
+  splits the work into ~8K-token requests and backs off when the limit is hit, so
+  indexing a two-hour recording still completes, just slowly. It prints its progress
+  and each wait, so a long pause is visible rather than looking like a hang. Adding a
+  payment method to the Voyage account removes the wait; pass a larger
+  `max_tokens_per_request` to take advantage of it.
+- **One chunk is over the request budget** — printed as a warning and sent on its own.
+  Voyage truncates anything past the model's context window, so an unusually long
+  chunk may be embedded only in part.
+- **`ServerError` / `APIConnectionError`** — retried with backoff. Authentication and
+  malformed-request errors fail immediately, since waiting cannot help.
+
 ## Models Used
 
 | Purpose | Model |
 |---------|-------|
-| LLM responses | Claude (via Anthropic API) |
+| LLM responses | Claude (via Anthropic API); `claude-haiku-4-5` by default, `--llm-model` to change |
 | Text embeddings | `voyage-3-large` (Voyage AI) |
 | Audio transcription | Whisper via `faster-whisper` (CTranslate2), GPU-accelerated |
 
 ## Notes
 
 - `intel_audio_logic.py` transcribes audio itself via `transcribe.py`, caching results in `transcripts/`. Use `transcribe.py` directly when you only want a transcript (or subtitles) without the chat loop.
+- Retrieval currently uses the single best-matching chunk (`k=1` in
+  `Retriever.search`), so each answer is grounded in one ~5-sentence window.
+  Raising `k` and joining the results would give Claude more to work with.
 - The `.gitignore` excludes `.env` to protect API keys — never commit that file.

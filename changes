@@ -1,8 +1,8 @@
 # Changes on `gpu-transcription`
 
-**Generated:** 2026-09-29 21:22 PDT
+**Generated:** 2026-09-29 21:47 PDT
 **Branch:** `gpu-transcription` (branched from `main` at `9b8a1be`)
-**Status:** 7 commits, not yet pushed to `origin`
+**Status:** 9 commits, not yet pushed to `origin`
 
 Summary: added GPU-accelerated transcription, wired it into the RAG pipeline, made
 answers cite where in the audio they came from, and repaired several pre-existing
@@ -62,15 +62,20 @@ either platform.
 
 ### Measured speedup
 
-Same 5:50 clip, `base` model, RTX 4050 Laptop (6 GB) vs. a 20-thread CPU:
+Same 5:50 clip, `base` model, RTX 4050 Laptop (6 GB) vs. a 20-thread CPU, median of
+three runs with model and audio already cached:
 
 | Command | Time | Speed |
 |---------|------|-------|
-| `--device cpu` (int8) | 83.4 s | 4.2x realtime |
-| GPU default (float16, beam 5) | 25.1 s | 13.9x realtime |
-| `--batch-size 16 --beam-size 1` | **8.0 s** | **43.8x realtime** |
+| `--device cpu` (int8) | ~30 s | 11.5x realtime |
+| GPU default (float16, beam 5) | ~10.5 s | 33x realtime |
+| `--batch-size 16` | **~4 s** | **60–95x realtime** |
 
-`large-v3` also fits in 6 GB: 23.5 s at `--batch-size 8` (14.9x realtime).
+`large-v3` also fits in 6 GB: ~18 s at `--batch-size 8` (19x realtime).
+
+These supersede the figures quoted in commit `233c51e` (83.4 s / 25.1 s / 8.0 s),
+which were first-ever runs on a cold file cache and came out 2–3x slower. The
+relative ordering was unaffected.
 
 ### `intel_audio_logic.py` rewritten as a CLI
 
