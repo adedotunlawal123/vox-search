@@ -270,7 +270,11 @@ If a model does not fit, the script reports the load failure and suggests
   and 10K tokens per minute, which a long transcript exceeds. `generate_embedding()`
   splits the work into ~8K-token requests and backs off when the limit is hit, so
   indexing a two-hour recording still completes, just slowly. Adding a payment
-  method to the Voyage account removes the wait.
+  method to the Voyage account removes the wait; pass a larger
+  `max_tokens_per_request` to take advantage of it.
+- **One chunk is over the request budget** — printed as a warning and sent on its
+  own. Voyage truncates anything past the model's context window, so an unusually
+  long chunk may be embedded only in part.
 
 ### Using it from Python
 
@@ -286,7 +290,15 @@ print(result["text"], result["language"], result["duration"])
 ### `ChunckAndEmbed.py`
 
 - **`chunk_by_sentence(text, max_sentences_per_chunk=5, overlap_sentences=1)`** — Splits text into overlapping sentence chunks using regex.
-- **`generate_embedding(chunks, model="voyage-3-large")`** — Calls Voyage AI to embed a string or list of strings.
+- **`generate_embedding(chunks, model="voyage-3-large", input_type="query", max_tokens_per_request=8000)`**
+  — Embeds a string or list of strings. Counts tokens with Voyage's own tokenizer,
+  splits the work into requests that fit `max_tokens_per_request`, and retries with
+  backoff on rate limits and transient server errors. Raise the budget on a paid
+  account: a 32K-token transcript goes out as 1 request at `40000` instead of 5 at
+  the default.
+- **`chunk_segments(segments, ...)`** — Chunks timestamped transcript segments,
+  interpolating sentence times across each segment so a chunk can be cited back to
+  a position in the audio.
 
 ### `HybridSearchImplementation.py`
 

@@ -25,58 +25,112 @@ def chunk_by_sentence(text, max_sentences_per_chunk=5, overlap_sentences=1):
     return chunks
 
 
-# Voyage rejects a request whose token count exceeds the per-minute budget, so long
-# transcripts have to be embedded in pieces. 8k leaves headroom under the 10k/min
-# free-tier limit while still filling a request on a paid one.
-MAX_TOKENS_PER_REQUEST = 8000
+# How much goes in one request is decided by rate limits, not by the model: Voyage's
+# free tier allows 10k tokens/min, so 8k leaves headroom while still filling a
+# request on a paid account. Override per call with max_tokens_per_request.
+DEFAULT_MAX_TOKENS_PER_REQUEST = 8000
+
+# Retried with backoff; everything else (auth, malformed request) fails immediately
+# because waiting cannot help.
+TRANSIENT_ERRORS = (
+    voyageai.error.RateLimitError,
+    voyageai.error.ServerError,
+    voyageai.error.ServiceUnavailableError,
+    voyageai.error.APIConnectionError,
+)
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token count -- about 4 characters per token is close enough to batch on."""
+    """Fallback token count at roughly 4 characters per token.
+
+    Only used when the real tokenizer is unavailable. It runs about 12% over on
+    English prose but around 45% *under* on CJK and code, and underestimating is
+    the direction that gets a request rejected.
+    """
     return max(1, len(text) // 4)
 
 
-def _batch_by_tokens(texts, max_tokens=MAX_TOKENS_PER_REQUEST):
-    """Split texts into groups that should each fit in one Voyage request."""
+def _count_tokens(texts, model):
+    """Per-text token counts from Voyage's own tokenizer, falling back to the estimate.
+
+    The tokenizer is fetched from the Hugging Face Hub the first time it is used, so
+    this falls back to _estimate_tokens when it cannot be loaded (offline, say).
+    Counting is local and cheap once cached: a few hundred chunks take well under a
+    tenth of a second.
+    """
+    try:
+        return [vog_client.count_tokens([text], model=model) for text in texts]
+    except Exception:
+        return [_estimate_tokens(text) for text in texts]
+
+
+def _batch_by_tokens(texts, counts, max_tokens):
+    """Group texts into requests that each stay within max_tokens.
+
+    A text larger than the entire budget cannot be made to fit, so it is sent on its
+    own with a warning, rather than silently dropped or folded into a request that
+    would be rejected. Voyage truncates anything past the model's context window.
+    """
     batch, budget = [], 0
-    for text in texts:
-        tokens = _estimate_tokens(text)
+    for text, tokens in zip(texts, counts):
+        if tokens > max_tokens:
+            if batch:
+                yield batch
+                batch, budget = [], 0
+            print(
+                f"  Warning: one chunk is {tokens} tokens, over the "
+                f"{max_tokens}-token request budget; sending it on its own"
+            )
+            yield [text]
+            continue
+
         if batch and budget + tokens > max_tokens:
             yield batch
             batch, budget = [], 0
         batch.append(text)
         budget += tokens
+
     if batch:
         yield batch
 
 
 def _embed_batch(batch, model, input_type, max_retries=6):
-    """Embed one batch, backing off when Voyage reports a rate limit.
+    """Embed one batch, backing off on rate limits and transient server errors.
 
     Retrying rather than pre-emptively sleeping keeps paid accounts running at full
     speed, and slows down only as much as a restricted account actually requires.
     """
-    delay = 20.0  # the limit is per minute, so short retries are pointless
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             return vog_client.embed(batch, model=model, input_type=input_type).embeddings
-        except voyageai.error.RateLimitError:
-            if attempt == max_retries - 1:
+        except TRANSIENT_ERRORS as exc:
+            if attempt == max_retries:
                 raise
+            # Rate limits are measured per minute, so short retries are pointless;
+            # a dropped connection is worth retrying straight away.
+            base = 20.0 if isinstance(exc, voyageai.error.RateLimitError) else 2.0
+            delay = min(base * (1.5 ** (attempt - 1)), 90.0)
             print(
-                f"  Voyage rate limit hit; waiting {delay:.0f}s "
-                f"(attempt {attempt + 1}/{max_retries - 1})"
+                f"  Voyage {type(exc).__name__}; waiting {delay:.0f}s "
+                f"(attempt {attempt}/{max_retries - 1})"
             )
             time.sleep(delay)
-            delay = min(delay * 1.5, 90.0)
+
     raise AssertionError("unreachable")
 
 
-def generate_embedding(chunks, model="voyage-3-large", input_type="query"):
+def generate_embedding(
+    chunks,
+    model="voyage-3-large",
+    input_type="query",
+    max_tokens_per_request=DEFAULT_MAX_TOKENS_PER_REQUEST,
+):
     is_list = isinstance(chunks, list)
     input = chunks if is_list else [chunks]
 
-    batches = list(_batch_by_tokens(input))
+    counts = _count_tokens(input, model)
+    batches = list(_batch_by_tokens(input, counts, max_tokens_per_request))
+
     embeddings = []
     for i, batch in enumerate(batches, start=1):
         if len(batches) > 1:
