@@ -1,8 +1,8 @@
 # Changes on `gpu-transcription`
 
-**Generated:** 2026-09-29 20:58 PDT
+**Generated:** 2026-09-29 21:22 PDT
 **Branch:** `gpu-transcription` (branched from `main` at `9b8a1be`)
-**Status:** 5 commits, not yet pushed to `origin`
+**Status:** 7 commits, not yet pushed to `origin`
 
 Summary: added GPU-accelerated transcription, wired it into the RAG pipeline, made
 answers cite where in the audio they came from, and repaired several pre-existing
@@ -23,6 +23,8 @@ defects that prevented the pipeline from running at all.
 | `c57cbf5` | 2026-09-29 19:41 | Normalize line endings and indentation |
 | `a34d8a8` | 2026-09-29 20:14 | Cite where in the audio each answer came from |
 | `67c0225` | 2026-09-29 20:48 | Make embedding batching correct for arbitrary input |
+| `601d521` | 2026-09-29 21:02 | Record the branch's changes in the changes file |
+| `507b74c` | 2026-09-29 21:20 | Resolve `--transcript` against the transcript cache |
 
 ---
 
@@ -184,6 +186,27 @@ just `RateLimitError` — a dropped connection previously failed a whole indexin
 Backoff starts at 20 s for rate limits (measured per minute) and 2 s for everything
 else. `AuthenticationError` and malformed requests still fail immediately, because
 waiting cannot help.
+
+---
+
+## 6. `--transcript` path resolution (`507b74c`)
+
+`--transcript wrd.json` failed with "transcript not found" even though the file sat
+in `transcripts/wrd.json`, because the value was treated as a literal path — and that
+directory is where the script itself writes, so it is the likeliest thing to be passed
+by name.
+
+`resolve_transcript()` tries the literal path, then the same name inside
+`transcripts/`, then both with `.json` and `.txt` appended when no suffix was given.
+A bare name prefers `.json`, the form carrying segment timings. All of these now
+resolve to `transcripts/wrd.json`:
+
+```
+wrd    wrd.json    transcripts/wrd.json    transcripts\wrd.json
+```
+
+`Learn_Transformer` in the repo root still resolves as before. When nothing matches,
+the error lists what is cached and marks which entries are timestamped.
 
 ---
 
