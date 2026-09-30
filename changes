@@ -1,0 +1,255 @@
+# Changes on `gpu-transcription`
+
+**Generated:** 2026-09-29 21:47 PDT
+**Branch:** `gpu-transcription` (branched from `main` at `9b8a1be`)
+**Status:** 9 commits, not yet pushed to `origin`
+
+Summary: added GPU-accelerated transcription, wired it into the RAG pipeline, made
+answers cite where in the audio they came from, and repaired several pre-existing
+defects that prevented the pipeline from running at all.
+
+```
+ 12 files changed, 1881 insertions(+), 579 deletions(-)
+```
+
+---
+
+## Commits
+
+| Commit | Time | Summary |
+|--------|------|---------|
+| `233c51e` | 2026-09-29 19:40 | Add GPU-accelerated transcription and wire it into the pipeline |
+| `be90c8d` | 2026-09-29 19:41 | Move the notebook's loose functions into a ConversationHandler class |
+| `c57cbf5` | 2026-09-29 19:41 | Normalize line endings and indentation |
+| `a34d8a8` | 2026-09-29 20:14 | Cite where in the audio each answer came from |
+| `67c0225` | 2026-09-29 20:48 | Make embedding batching correct for arbitrary input |
+| `601d521` | 2026-09-29 21:02 | Record the branch's changes in the changes file |
+| `507b74c` | 2026-09-29 21:20 | Resolve `--transcript` against the transcript cache |
+
+---
+
+## 1. GPU-accelerated transcription (`233c51e`)
+
+### New file: `transcribe.py`
+
+A standalone CLI and importable module that transcribes audio using the GPU when one
+is available. Auto-selects backend and device so the same command works wherever it
+is deployed:
+
+- **faster-whisper** (CTranslate2) preferred — float16 on CUDA, int8 on CPU
+- **openai-whisper** (PyTorch) fallback — also the only option for Apple MPS
+- Output formats: `txt`, `json` (with timestamps), `srt`, `vtt`
+- Batch processing of several files; batched GPU decoding via `--batch-size`
+- Progress and timings go to stderr, so stdout stays a clean, pipeable transcript
+- `--list-devices` reports what the current machine will use
+
+### `preload_cuda_libraries()`
+
+CTranslate2 resolves cuBLAS and cuDNN lazily — often not until the first decode — and
+does **not** consult directories added via `os.add_dll_directory`. The `nvidia-*-cu12`
+pip wheels install those libraries inside `site-packages`, where the OS loader never
+looks, so GPU transcription failed with:
+
+```
+Library cublas64_12.dll is not found or cannot be loaded
+```
+
+The fix loads each library by absolute path up front, which registers it in the
+process under the plain base name CTranslate2 later asks for. Windows uses
+`os.add_dll_directory` plus `ctypes.CDLL`; Linux preloads with `RTLD_GLOBAL`, since
+`LD_LIBRARY_PATH` cannot be changed after startup. No `PATH` setup is needed on
+either platform.
+
+### Measured speedup
+
+Same 5:50 clip, `base` model, RTX 4050 Laptop (6 GB) vs. a 20-thread CPU, median of
+three runs with model and audio already cached:
+
+| Command | Time | Speed |
+|---------|------|-------|
+| `--device cpu` (int8) | ~30 s | 11.5x realtime |
+| GPU default (float16, beam 5) | ~10.5 s | 33x realtime |
+| `--batch-size 16` | **~4 s** | **60–95x realtime** |
+
+`large-v3` also fits in 6 GB: ~18 s at `--batch-size 8` (19x realtime).
+
+These supersede the figures quoted in commit `233c51e` (83.4 s / 25.1 s / 8.0 s),
+which were first-ever runs on a cold file cache and came out 2–3x slower. The
+relative ordering was unaffected.
+
+### `intel_audio_logic.py` rewritten as a CLI
+
+Takes an audio file directly, transcribes it through `transcribe.py`, and caches the
+result so reruns skip transcription unless the audio is newer or `--retranscribe` is
+passed. Flags for model, device, language, beam size, batch size, and the Claude
+model.
+
+### Pre-existing defects repaired
+
+The pipeline did not run before this branch. Three separate faults:
+
+1. `intel_audio_logic.py` imported `converse_with_LLM` as a module-level function,
+   but it is a method — `ImportError` at startup, before anything else ran.
+2. `ConversationHandler` read `retriever`, `client` and `model` from module globals
+   that were never defined in that file — `NameError` on the first question. They are
+   constructor arguments now, keeping the class independent of the entry point.
+3. `take_input(self: Any)` had no import for `Any`. This only worked under Python
+   3.14's lazy annotations (PEP 649); on 3.13 it was an import-time `NameError`.
+
+Also: `converse_with_LLM()` now loops until the user types `exit`, which the README
+already documented but the code did not do.
+
+---
+
+## 2. Notebook refactor (`be90c8d`)
+
+Pre-existing working-tree changes to `RAGChat.ipynb` from earlier exploration,
+committed so the branch carries every unpushed change. Not authored as part of this
+work. The notebook defines its own copy of the conversation logic, so it is
+unaffected by the changes to `ConversationHandler.py`.
+
+---
+
+## 3. Line-ending normalization (`c57cbf5`)
+
+No content changes — `git diff --ignore-all-space` is empty for all three files.
+`ChunckAndEmbed.py` and `HybridSearchImplementation.py` had picked up CRLF endings
+from editing on Windows while the committed versions were LF, and
+`.vscode/settings.json` shifted indentation. Committed separately to keep ~900 lines
+of churn out of the functional diffs.
+
+**Open item:** a `.gitattributes` containing `* text=auto eol=lf` would stop this
+recurring. Not added.
+
+---
+
+## 4. Audio timestamps on answers (`a34d8a8`)
+
+Answers now cite where in the recording the supporting context came from:
+
+```
+Ask about the audio (or 'exit' to quit): what is the main topic being discussed?
+
+Based on the context spoken at 1:51:28-1:51:50, the main topic is ...
+
+  [audio 1:51:28-1:51:50]
+```
+
+The timestamp is also given to Claude alongside the context, so "when was X
+mentioned?" can be answered directly.
+
+- **`chunk_segments()`** (`ChunckAndEmbed.py`) chunks timestamped segments rather
+  than raw text. A Whisper segment can span 30 seconds and several sentences, which
+  is too coarse to cite, so sentence times are interpolated across the segment by
+  character position.
+- **Transcripts cached as JSON** (`transcripts/<name>.json`), since plain text cannot
+  carry timings. A `.txt` copy is written alongside for reading. A plain-text
+  transcript passed via `--transcript` still works, just without citations.
+- **`format_clock()`** (`transcribe.py`) is the single place a time is rendered for
+  humans, switching to `H:MM:SS` once the audio passes an hour.
+
+Precision trade-offs: `--batch-size` is much faster but yields ~30 s segments;
+`--whisper-model large-v3` segments more accurately than `base`.
+
+### Repository hygiene
+
+`__pycache__` was tracked from an earlier commit and rewritten on every run.
+`.gitignore` already covered it; the files needed `git rm --cached`. `.gitignore`
+also gained `transcripts/` and `__pycache__/`.
+
+---
+
+## 5. Embedding batching (`a34d8a8`, corrected in `67c0225`)
+
+Voyage's free tier allows 3 requests and 10K tokens per minute. A 127-minute
+transcript is ~32K tokens and was rejected outright as a single request, so indexing
+long audio failed with `voyageai.error.RateLimitError`.
+
+`generate_embedding()` now splits the work into token-budgeted requests and retries
+with backoff. Retrying rather than sleeping pre-emptively keeps paid accounts running
+at full speed.
+
+`67c0225` then closed three gaps that only stayed hidden because this pipeline feeds
+the function short English chunks:
+
+1. **Real tokenizer instead of `len//4`.** The heuristic ran ~12% over on English
+   prose but ~45% **under** on CJK and code — three sample texts counted
+   160/340/101 real tokens against guesses of 90/190/105. Underestimating is the
+   direction that gets a request rejected. Even the English test transcript came to
+   32,182 real tokens against a ~27,000 estimate. Counting is local and cheap once
+   the tokenizer is cached (369 chunks in under 0.1 s), and falls back to the
+   heuristic when it cannot be loaded, so an offline run still works.
+2. **A text larger than the whole budget is sent on its own, with a warning.** It was
+   already ending up alone as a side effect of the windowing, but silently, so an
+   over-long chunk being truncated by Voyage gave no clue why.
+3. **The budget is a keyword argument**, not a module constant pinned to the free
+   tier. The 32K-token transcript goes out as one request at
+   `max_tokens_per_request=40000` instead of five at the default.
+
+Also retries `ServerError`, `ServiceUnavailableError` and `APIConnectionError`, not
+just `RateLimitError` — a dropped connection previously failed a whole indexing run.
+Backoff starts at 20 s for rate limits (measured per minute) and 2 s for everything
+else. `AuthenticationError` and malformed requests still fail immediately, because
+waiting cannot help.
+
+---
+
+## 6. `--transcript` path resolution (`507b74c`)
+
+`--transcript wrd.json` failed with "transcript not found" even though the file sat
+in `transcripts/wrd.json`, because the value was treated as a literal path — and that
+directory is where the script itself writes, so it is the likeliest thing to be passed
+by name.
+
+`resolve_transcript()` tries the literal path, then the same name inside
+`transcripts/`, then both with `.json` and `.txt` appended when no suffix was given.
+A bare name prefers `.json`, the form carrying segment timings. All of these now
+resolve to `transcripts/wrd.json`:
+
+```
+wrd    wrd.json    transcripts/wrd.json    transcripts\wrd.json
+```
+
+`Learn_Transformer` in the repo root still resolves as before. When nothing matches,
+the error lists what is cached and marks which entries are timestamped.
+
+---
+
+## Environment changes made outside git
+
+These were installed on this machine and are **not** captured by the repository.
+
+| Interpreter | Installed |
+|-------------|-----------|
+| Python 3.13 (`AppData\Local\Programs\Python\Python313`) | `faster-whisper` 1.2.1, `ctranslate2` 4.8.2, `av` 18.1.0, `onnxruntime`, `nvidia-cublas-cu12`, `nvidia-cudnn-cu12`, `nvidia-cuda-nvrtc-cu12` |
+| Python 3.14 (`C:\Python314`) — the project's default `python` | same set, with `av` pinned to `<19` |
+
+**`av` must stay below 19.** PyAV 19.0.0 broke compatibility with `faster-whisper`
+1.2, failing at decode time with:
+
+```
+open() got an unexpected keyword argument 'metadata_errors'
+```
+
+**Large model downloads** may need `HF_HUB_DISABLE_XET=1`; the Hugging Face transfer
+backend produced repeated connection resets on the multi-GB `large-v3` download.
+
+---
+
+## Verified
+
+- GPU transcription on Python 3.14 (the project's default interpreter): 40.5x realtime
+- Full pipeline on a 127-minute recording: 266 segments, 369 chunks, 5 embedding
+  batches through the free-tier rate limit, citation correct at `1:51:28-1:51:50`
+- Transcript cache reuse, `--retranscribe`, and the `--transcript` path
+- All four output formats, batch processing, and stdout/file routing in `transcribe.py`
+- Graceful, actionable errors for a missing backend, missing CUDA runtime, and GPU OOM
+
+## Open items
+
+- Branch is not pushed to `origin`.
+- No `.gitattributes`, so the CRLF churn will recur on Windows edits.
+- Retrieval still uses only the single best-matching chunk (`k=1`), so answers are
+  grounded in one ~5-sentence window. Raising `k` would improve answer quality.
+- `wrd.mp3` was transcribed successfully but has since been removed from the working
+  directory; `transcripts/wrd.json` retains the transcript.
