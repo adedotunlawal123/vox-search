@@ -1,55 +1,172 @@
+"""Entry point: transcribe audio on the GPU, index the transcript, then chat about it.
+
+    python intel_audio_logic.py                                  # chat over the existing transcript
+    python intel_audio_logic.py lecture.mp3                       # transcribe, then chat
+    python intel_audio_logic.py lecture.mp3 --model large-v3       # better accuracy
+    python intel_audio_logic.py lecture.mp3 --retranscribe         # ignore the cached transcript
+    python intel_audio_logic.py --transcript Learn_Transformer     # use a transcript you already have
+
+Transcription itself lives in transcribe.py, which picks the GPU when one is
+available. Run `python transcribe.py --list-devices` to see what this machine will use.
+"""
+
+import argparse
+import time
+from pathlib import Path
+
 from dotenv import load_dotenv
-import voyageai
+
 load_dotenv()
-vog_client = voyageai.Client()
-from anthropic import Anthropic
-#import whisper
-import re
-client = Anthropic()
-model = "claude-haiku-4-5"
+
 from ChunckAndEmbed import chunk_by_sentence as chunker
 from ChunckAndEmbed import generate_embedding as embedder
 from HybridSearchImplementation import VectorIndex
 from HybridSearchImplementation import BM25Index
 from HybridSearchImplementation import Retriever
-from ConversationHandler import ConversationHandler, converse_with_LLM
+from ConversationHandler import ConversationHandler, DEFAULT_MODEL
+from transcribe import transcribe_audio
+
+# Transcript used when no audio file is given.
+DEFAULT_TRANSCRIPT = Path("Learn_Transformer")
+# Transcripts produced from audio are cached here so a rerun does not re-transcribe.
+TRANSCRIPT_DIR = Path("transcripts")
 
 
+def get_transcript(args) -> str:
+    """Return the transcript text, transcribing the audio only when necessary."""
+    if args.transcript:
+        source = Path(args.transcript)
+        if not source.is_file():
+            raise SystemExit(f"error: transcript not found: {source}")
+        print(f"Using transcript {source}")
+        return source.read_text(encoding="utf-8")
+
+    if not args.audio:
+        if not DEFAULT_TRANSCRIPT.is_file():
+            raise SystemExit(
+                f"error: no audio file given and {DEFAULT_TRANSCRIPT} does not exist.\n"
+                "Pass an audio file: python intel_audio_logic.py your_audio.mp3"
+            )
+        print(f"Using transcript {DEFAULT_TRANSCRIPT}")
+        return DEFAULT_TRANSCRIPT.read_text(encoding="utf-8")
+
+    audio = Path(args.audio)
+    if not audio.is_file():
+        raise SystemExit(f"error: audio file not found: {audio}")
+
+    # Reuse a previous transcript unless the audio is newer or --retranscribe was asked for.
+    cached = TRANSCRIPT_DIR / f"{audio.stem}.txt"
+    if (
+        cached.is_file()
+        and not args.retranscribe
+        and cached.stat().st_mtime >= audio.stat().st_mtime
+    ):
+        print(f"Using cached transcript {cached} (--retranscribe to redo it)")
+        return cached.read_text(encoding="utf-8")
+
+    print(f"Transcribing {audio.name} ...")
+    started = time.perf_counter()
+    result = transcribe_audio(
+        audio,
+        model=args.whisper_model,
+        device=args.device,
+        language=args.language,
+        beam_size=args.beam_size,
+        batch_size=args.batch_size,
+    )
+    elapsed = time.perf_counter() - started
+
+    speed = f", {result['duration'] / elapsed:.1f}x realtime" if elapsed > 0 else ""
+    print(
+        f"Transcribed {result['duration'] / 60:.1f} min of audio in {elapsed:.1f}s"
+        f"{speed} on {result.get('device', args.device)}"
+    )
+
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    cached.write_text(result["text"], encoding="utf-8")
+    print(f"Saved transcript to {cached}")
+    return result["text"]
 
 
-# Load the model
-#trnscrb_model = whisper.load_model("base")
-#Transcribe the audio
-#result = trnscrb_model.transcribe(r"C:\Users\adedo\Downloads\What are Transformers (Machine Learning Model)_.mp3")
-# Print the text
-#print(result["text"])
-#write the transcript into  file
-#with open("Learn_Transformer", "w", encoding="utf-8") as file:
-    #file.write(result["text"])
+def build_retriever(text: str) -> Retriever:
+    """Chunk the transcript and index it for hybrid (vector + keyword) search."""
+    chunks = chunker(text)
+    print(f"Indexing {len(chunks)} chunks ...")
+
+    # Generate a vector embedding of the chunks using VoyageAI;
+    # see HybridSearchImplementation for more details.
+    vector_index = VectorIndex(embedding_fn=embedder)
+    # Instantiate the BestMatch 25 class for keyword search
+    bm25_index = BM25Index()
+
+    # The class that does the hybrid search; see HybridSearchImplementation for details
+    retriever = Retriever(bm25_index, vector_index)
+
+    # Add all chunks to the retriever, which internally passes them along to both indexes
+    retriever.add_documents([{"content": chunk} for chunk in chunks])
+    return retriever
 
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="intel_audio_logic.py",
+        description="Transcribe audio (GPU-accelerated) and chat about it with Claude.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("\n\n")[1],
+    )
+    p.add_argument("audio", nargs="?", help="audio/video file to transcribe and chat about")
+    p.add_argument(
+        "-t", "--transcript", metavar="PATH",
+        help=f"chat over an existing transcript instead of transcribing "
+             f"(default: {DEFAULT_TRANSCRIPT} when no audio is given)",
+    )
+    p.add_argument(
+        "--retranscribe", action="store_true",
+        help="re-transcribe even if a cached transcript exists",
+    )
 
-# Chunk source text by section
-with open("Learn_Transformer", "r") as f:
-    text = f.read()
+    transcription = p.add_argument_group("transcription (see transcribe.py for more)")
+    transcription.add_argument(
+        "-m", "--whisper-model", default="base", metavar="NAME",
+        help="whisper model size (default: base; large-v3 is more accurate)",
+    )
+    transcription.add_argument(
+        "-d", "--device", default="auto", choices=["auto", "cuda", "cpu", "mps"],
+        help="compute device (default: auto -- uses the GPU when present)",
+    )
+    transcription.add_argument("-l", "--language", help="spoken language code, e.g. en")
+    transcription.add_argument(
+        "--beam-size", type=int, default=5, metavar="N",
+        help="beam width; 1 is greedy and fastest (default: 5)",
+    )
+    transcription.add_argument(
+        "--batch-size", type=int, default=0, metavar="N",
+        help="batched GPU decoding, a large speedup (try 8 or 16; default: off)",
+    )
 
-#chunk the text
-chunks = chunker(text)
-
-#Generate a vector embedding of the chunck using VogayeAI; See HybridSearchImplementation package for more details
-vector_index = VectorIndex(embedding_fn=embedder)
-#Instantiate the BestMatch 25 class for key word search
-bm25_index = BM25Index()
-
-#Instantiate class thatdoes the hybrid search See HybridSearchImplementation package for more details
-retriever = Retriever(bm25_index, vector_index)
-
-# Add all chunks to the retriever, which internally passes them along to both indexes
-retriever.add_documents([{"content": chunk} for chunk in chunks])
+    p.add_argument(
+        "--llm-model", default=DEFAULT_MODEL, metavar="NAME",
+        help=f"Claude model for answering questions (default: {DEFAULT_MODEL})",
+    )
+    return p
 
 
-#Instantiate the ConversationHandler class
-convo = ConversationHandler()
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
-#Start the conversation with the LLM
-convo.converse_with_LLM()
+    text = get_transcript(args)
+    retriever = build_retriever(text)
+
+    # Instantiate the ConversationHandler class with the index it should search
+    convo = ConversationHandler(retriever, model=args.llm_model)
+
+    # Start the conversation with the LLM
+    try:
+        convo.converse_with_LLM()
+    except (EOFError, KeyboardInterrupt):
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
