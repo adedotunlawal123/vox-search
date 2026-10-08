@@ -14,7 +14,6 @@ available. Run `python transcribe.py --list-devices` to see what this machine wi
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
@@ -45,7 +44,9 @@ def get_transcript(args) -> dict:
     cannot be traced back to a position in the audio.
     """
     if args.transcript:
-        source = resolve_transcript(args.transcript)
+        source = Path(args.transcript)
+        if not source.is_file():
+            raise SystemExit(f"error: transcript not found: {source}")
         print(f"Using transcript {source}")
         return load_transcript_file(source)
 
@@ -96,57 +97,6 @@ def get_transcript(args) -> dict:
     cached.with_suffix(".txt").write_text(result["text"], encoding="utf-8")
     print(f"Saved transcript to {cached}")
     return result
-
-
-def resolve_transcript(value: str) -> Path:
-    """Find a transcript from a path, a name in the cache, or a bare stem.
-
-    --transcript is usually pointed at something this script itself wrote into
-    transcripts/, so `wrd`, `wrd.json` and `transcripts/wrd.json` all resolve rather
-    than failing on a literal path that was never going to exist. A missing suffix
-    prefers .json, since that is the form carrying segment timings.
-    """
-    given = Path(value)
-    bare_name = not given.is_absolute() and given.parent == Path(".")
-
-    candidates = [given]
-    if bare_name:
-        candidates.append(TRANSCRIPT_DIR / given.name)
-    if not given.suffix:
-        for base in [given] + ([TRANSCRIPT_DIR / given.name] if bare_name else []):
-            candidates += [base.with_suffix(".json"), base.with_suffix(".txt")]
-
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-
-    raise SystemExit(transcript_not_found_message(value))
-
-
-def transcript_not_found_message(value: str) -> str:
-    """Explain what was not found, and show what is actually in the cache."""
-    lines = [f"error: transcript not found: {value}"]
-
-    cached = (
-        sorted(path for path in TRANSCRIPT_DIR.iterdir() if path.is_file())
-        if TRANSCRIPT_DIR.is_dir()
-        else []
-    )
-    if cached:
-        lines.append(f"\nAvailable in {TRANSCRIPT_DIR}{os.sep}:")
-        for path in cached:
-            note = "  (timestamped)" if path.suffix.lower() == ".json" else ""
-            lines.append(f"  {path.name}{note}")
-        lines.append(
-            f"\nPass one as: --transcript {TRANSCRIPT_DIR}{os.sep}<name>"
-            "   (or just the name, or the name without its extension)"
-        )
-    else:
-        lines.append(
-            f"\nNothing cached in {TRANSCRIPT_DIR}{os.sep} yet. Transcribe some audio first:"
-            "\n  python intel_audio_logic.py your_audio.mp3"
-        )
-    return "\n".join(lines)
 
 
 def load_transcript_file(path: Path) -> dict:
